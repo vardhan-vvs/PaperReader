@@ -1,2 +1,4 @@
 .vscode/
 paperreader_env/
+*.pyc
+*/__pycache__/
