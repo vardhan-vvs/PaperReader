@@ -1,26 +1,30 @@
 import streamlit as st
-import faiss
-import pickle
-import numpy as np
+# import faiss
+from langchain_community.vectorstores import FAISS
+from langchain.embeddings.base import Embeddings
 import os
 from sentence_transformers import SentenceTransformer
 from langchain_ollama import OllamaLLM
 import pdfplumber
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-st.set_page_config(page_title="Research Paper Assistant", page_icon="📄", layout="wide")
-st.title("RAG based Research Paper Assistant")
+class MiniLMEmbeddings(Embeddings):
+    def __init__(self, model_name='all-MiniLM-L6-v2', device='cuda'):
+        self.model = SentenceTransformer(model_name, device=device)
 
-model = SentenceTransformer('all-MiniLM-L6-v2', device='cuda')
-llm = OllamaLLM(model = "llama3:instruct")
+    def embed_documents(self, texts):
+        return [self.model.encode(text).tolist() for text in texts]
 
-def process_pdf(pdf_path):
-    chunks = []
+    def embed_query(self, text):
+        return self.model.encode(text).tolist()
+
+def extract_text_from_pdf(pdf_path):
+    chunks = ""
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             text = page.extract_text()
             if text:
-                chunks.append(text)
+                chunks += text
     return chunks
 
     # splitter = RecursiveCharacterTextSplitter(
@@ -32,18 +36,27 @@ def process_pdf(pdf_path):
     # docs = splitter.split_documents(pages)
     # return docs
 
-def build_faiss(chunks):
-    embeddings = model.encode(chunks, convert_to_numpy=True)
-    index = faiss.IndexFlatL2(embeddings.shape[1])
-    index.add(embeddings)
-    return index, chunks
+def buidl_vector_store(texts):
+    chunks = []
+    chunk_size = 1000
+    chunk_overlap = 200
+    for i in range(0, len(texts), chunk_size - chunk_overlap):
+        chunk = texts[i:i + chunk_size]
+        chunks.append(chunk)
+    
+    embedder = MiniLMEmbeddings()
+    vs = FAISS.from_texts(chunks, embedder)
+    
+    return vs
 
-def rag_answer(query, index, chunks):
-    query_embedding = model.encode([query], convert_to_numpy=True)
-    data, indices = index.search(query_embedding, k=5)
-
-    relevant_chunks = [chunks[i] for i in indices[0]]
-    context = "\n\n".join(relevant_chunks)
+def rag_answer(query, vs):
+    retriever = vs.as_retriever(search_type = "similarity", search_kwargs={"k": 5})
+    docs = retriever.get_relevant_documents(query)
+    
+    context = "\n".join([doc.page_content for doc in docs])
+    
+    llm = OllamaLLM(model="llama3:instruct")
+    
     prompt = f"""
     You are a research paper assistant. You will answer the question only using the context below.
     If you don't know the answer, say you don't know. Do not make up an answer.
@@ -58,25 +71,35 @@ def rag_answer(query, index, chunks):
     answer = llm.invoke(prompt)
     return answer
 
-st.sidebar.header("Upload Research Paper")
-pdf_file = st.sidebar.file_uploader("Upload a PDF file", type=["pdf"])
+st.set_page_config(page_title="Research Paper reader", layout="wide")
+st.title("Paper Reader - Chat with your research papers")
 
-if pdf_file:
-    st.success("PDF uploaded successfully!")
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "vs" not in st.session_state:
+    st.session_state.vs = None
+
+
+uploaded_file = st.file_uploader("Upload a PDF file", type=["pdf"])
+if uploaded_file is not None:
+    with st.spinner("Reading the paper..."):
+        text = extract_text_from_pdf(uploaded_file)
     
-    chunks = process_pdf(pdf_file)
-    index, chunks = build_faiss(chunks)
+    with st.spinner("Building embeddings ..."):
+        st.session_state.vs = buidl_vector_store(text)
+
+    st.success("Paper processed successfully! You can now ask questions about the paper.")
+
+
+for msg in st.session_state.messages:
+    st.chat_message(msg["role"]).write(msg["content"])
     
-    st.sidebar.write(f"Total chunks created: {len(chunks)}")
-    
-    st.subheader("Ask a question about the paper")
-    user_query = st.text_input("Enter your question here:")
-    
-    if st.button("Get Answer"):
-        if user_query:
-            with st.spinner("Retrieving answer..."):
-                answer = rag_answer(user_query, index, chunks)
-            st.markdown("### Answer:")
-            st.write("Answer:", answer)
-else:
-    st.warning("Please upload a PDF file to get started.")
+query = st.chat_input("Ask a question about the paper")
+if query and st.session_state.vs is not None:
+    st.chat_message("user").write(query)
+    st.session_state.messages.append({"role": "user", "content": query})
+    with st.chat_message("assistant"):
+        with st.spinner("Finding the answer..."):
+            answer = rag_answer(query, st.session_state.vs)
+            st.write(answer)
+    st.session_state.messages.append({"role": "assistant", "content": answer})
