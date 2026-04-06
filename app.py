@@ -1,28 +1,23 @@
-from pyexpat import model
-
 import streamlit as st
-import torch
+# import torch
 from langchain_community.vectorstores import FAISS
 from langchain.embeddings.base import Embeddings
 from sentence_transformers import SentenceTransformer
 from langchain_ollama import ChatOllama
 import pdfplumber
 
-print(torch.cuda.is_available())      # True = GPU detected
-print(torch.cuda.get_device_name(0))  # Shows GPU name
-print(torch.cuda.device_count())      # Number of GPUs
+# print(torch.cuda.is_available())      # True = GPU detected
+# print(torch.cuda.get_device_name(0))  # Shows GPU name
+# print(torch.cuda.device_count())      # Number of GPUs
 class MiniLMEmbeddings(Embeddings):
     def __init__(self, model_name='all-MiniLM-L6-v2', device='cuda'):
         self.model = SentenceTransformer(model_name, device=device)
-        print(f"Using device: {self.model.device}")
 
     def embed_documents(self, texts):
         return [self.model.encode(text).tolist() for text in texts]
-        # return self.model.embed_documents(texts)
 
     def embed_query(self, text):
         return self.model.encode(text).tolist()
-        # return self.model.embed_query(text)
 
 def extract_text_from_pdf(pdf_path):
     chunks = ""
@@ -32,15 +27,6 @@ def extract_text_from_pdf(pdf_path):
             if text:
                 chunks += text
     return chunks
-
-    # splitter = RecursiveCharacterTextSplitter(
-    #     chunk_size=1000, 
-    #     chunk_overlap=100,
-    #     separators=["\n\n", "\n", ".", " ", ""]
-    # )
-
-    # docs = splitter.split_documents(pages)
-    # return docs
 
 def build_vector_store(texts):
     chunks = []
@@ -62,7 +48,7 @@ def rag_answer(query, vs):
     if vs is None:
         return "No text data available to answer the question."
     retriever = vs.as_retriever(search_kwargs={"k": 3})
-    docs = retriever.get_relevant_documents(query)
+    docs = retriever.invoke(query)
     
     if not docs:
         return "The document does not contain this info."
@@ -70,16 +56,16 @@ def rag_answer(query, vs):
     context = "\n".join([doc.page_content for doc in docs])
     
     llm = ChatOllama(
-        model="llama3:instruct",
+        model="llama3.2:3b",
         base_url="http://localhost:11434", 
         temperature=0,
-        num_ctx=4096,
+        num_ctx=2048,
+        num_gpu=28,
         request_timeout=300
         )
     
     prompt = f"""
     You are a research paper assistant. You will answer the question only using the context below.
-    If you don't know the answer, say you don't know. Do not make up an answer.
     If the answer is not in the context, say "The document does not contain this info."
     context:
     {context}
@@ -89,7 +75,7 @@ def rag_answer(query, vs):
     """
 
     answer = llm.invoke(prompt)
-    return answer
+    return answer.content if hasattr(answer, "content") else str(answer)
 
 st.set_page_config(page_title="Research Paper reader", layout="wide")
 st.title("Paper Reader - Chat with your research papers")
