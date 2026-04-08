@@ -3,7 +3,7 @@ import faiss
 import numpy as np
 import pickle
 
-from process_pdf import docs
+from paper_handler import docs
 
 # load embeddings model
 model = SentenceTransformer('all-MiniLM-L6-v2', device='cuda')

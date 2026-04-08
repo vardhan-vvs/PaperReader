@@ -4,11 +4,24 @@ from langchain_community.vectorstores import FAISS
 from langchain.embeddings.base import Embeddings
 from sentence_transformers import SentenceTransformer
 from langchain_ollama import ChatOllama
-import pdfplumber
+from paper_handler import extract_text
+import os
 
 # print(torch.cuda.is_available())      # True = GPU detected
 # print(torch.cuda.get_device_name(0))  # Shows GPU name
 # print(torch.cuda.device_count())      # Number of GPUs
+
+faiss_index_path = "faiss_indexes"
+
+def save_faiss_index(name, vs):
+    os.makedirs(faiss_index_path, exist_ok=True)
+    vs.save_local(os.path.join(faiss_index_path, name))
+    
+def load_faiss_index(name, embedder):
+    index_path = os.path.join(faiss_index_path, name)
+    if os.path.exists(index_path):
+        return FAISS.load_local(index_path, embedder, allow_dangerous_deserialization=True)
+    return None
 class MiniLMEmbeddings(Embeddings):
     def __init__(self, model_name='all-MiniLM-L6-v2', device='cuda'):
         self.model = SentenceTransformer(model_name, device=device)
@@ -18,15 +31,6 @@ class MiniLMEmbeddings(Embeddings):
 
     def embed_query(self, text):
         return self.model.encode(text).tolist()
-
-def extract_text_from_pdf(pdf_path):
-    chunks = ""
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                chunks += text
-    return chunks
 
 def build_vector_store(texts):
     chunks = []
@@ -95,7 +99,7 @@ if uploaded_file is not None and len(uploaded_file) > 0:
     for file in uploaded_file:
         if file.name not in st.session_state.paper_vs:
             with st.spinner(f"Reading {file.name}..."):
-                text = extract_text_from_pdf(file)
+                text = extract_text(file)
             
             with st.spinner(f"Building embeddings for {file.name}..."):
                 vs = build_vector_store(text)
