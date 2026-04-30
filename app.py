@@ -1,141 +1,200 @@
+# app.py — Streamlit entry point. UI and session orchestration only.
+# Run with: streamlit run app.py
+
 import streamlit as st
-# import torch
-from langchain_community.vectorstores import FAISS
-from langchain.embeddings.base import Embeddings
-from sentence_transformers import SentenceTransformer
-from langchain_ollama import ChatOllama
 from paper_handler import extract_text
-import os
 
-# print(torch.cuda.is_available())      # True = GPU detected
-# print(torch.cuda.get_device_name(0))  # Shows GPU name
-# print(torch.cuda.device_count())      # Number of GPUs
+from embeddings import get_embedder
+from rag import is_comparison_query, rag_stream
+from vector_store import (
+    build_vector_store,
+    delete_index,
+    file_hash,
+    index_name_for_hash,
+    load_index,
+    load_metadata,
+    merge_vector_stores,
+    save_index,
+    save_metadata,
+)
 
-faiss_index_path = "faiss_indexes"
+# ── Page config ────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Research Paper Reader", layout="wide")
 
-def save_faiss_index(name, vs):
-    os.makedirs(faiss_index_path, exist_ok=True)
-    vs.save_local(os.path.join(faiss_index_path, name))
-    
-def load_faiss_index(name, embedder):
-    index_path = os.path.join(faiss_index_path, name)
-    if os.path.exists(index_path):
-        return FAISS.load_local(index_path, embedder, allow_dangerous_deserialization=True)
-    return None
-class MiniLMEmbeddings(Embeddings):
-    def __init__(self, model_name='all-MiniLM-L6-v2', device='cuda'):
-        self.model = SentenceTransformer(model_name, device=device)
+# ── Session state init ─────────────────────────────────────────────────────────
+defaults = {
+    "paper_vs": {},         # filename → FAISS store
+    "paper_hashes": {},     # filename → SHA-256
+    "global_vs": None,      # merged store for "All papers"
+    "chat_history": {},     # filename (or "All papers") → [{"role","content"}, ...]
+}
+for key, val in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = val
 
-    def embed_documents(self, texts):
-        return [self.model.encode(text).tolist() for text in texts]
-
-    def embed_query(self, text):
-        return self.model.encode(text).tolist()
-
-def build_vector_store(texts):
-    chunks = []
-    chunk_size = 800
-    chunk_overlap = 100
-    for i in range(0, len(texts), chunk_size - chunk_overlap):
-        chunk = texts[i:i + chunk_size]
-        chunks.append(chunk)
-    
-    if not chunks:
-        return None
-    
-    embedder = MiniLMEmbeddings()
-    vs = FAISS.from_texts(chunks, embedder)
-    
-    return vs
-
-def rag_answer(query, vs):
-    if vs is None:
-        return "No text data available to answer the question."
-    retriever = vs.as_retriever(search_kwargs={"k": 3})
-    docs = retriever.invoke(query)
-    
-    if not docs:
-        return "The document does not contain this info."
-    
-    context = "\n".join([doc.page_content for doc in docs])
-    
-    llm = ChatOllama(
-        model="llama3.2:3b",
-        base_url="http://localhost:11434", 
-        temperature=0,
-        num_ctx=2048,
-        num_gpu=28,
-        request_timeout=300
-        )
-    
-    prompt = f"""
-    You are a research paper assistant. You will answer the question only using the context below.
-    If the answer is not in the context, say "The document does not contain this info."
-    context:
-    {context}
-    question:
-    {query}
-    Answer:
-    """
-
-    answer = llm.invoke(prompt)
-    return answer.content if hasattr(answer, "content") else str(answer)
-
-st.set_page_config(page_title="Research Paper reader", layout="wide")
-st.title("Paper Reader - Chat with your research papers")
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "paper_vs" not in st.session_state:
-    st.session_state.paper_vs = {}
-if "global_vs" not in st.session_state:
-    st.session_state.global_vs = None
+# ── Singletons ─────────────────────────────────────────────────────────────────
+embedder = get_embedder()
+disk_meta = load_metadata()     # {sha256: index_folder_name}
 
 
-uploaded_file = st.file_uploader("Upload one or more PDF files", type=["pdf"], accept_multiple_files=True)
-if uploaded_file is not None and len(uploaded_file) > 0:
-    global_text = ""
-    
-    for file in uploaded_file:
-        if file.name not in st.session_state.paper_vs:
-            with st.spinner(f"Reading {file.name}..."):
-                text = extract_text(file)
-            
-            with st.spinner(f"Building embeddings for {file.name}..."):
-                vs = build_vector_store(text)
-            if vs is None:
-                st.warning(f"No text found in {file.name}. Skipping this file.")
+# ── Sidebar — paper manager ────────────────────────────────────────────────────
+with st.sidebar:
+    st.title("📚 Paper Reader")
+    st.caption("Chat with your research papers")
+    st.divider()
+
+    # File uploader lives in the sidebar for a cleaner main area
+    uploaded_files = st.file_uploader(
+        "Upload PDFs",
+        type=["pdf"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+    )
+    st.caption("Upload one or more PDF files")
+    st.divider()
+
+    # Loaded papers list with per-paper remove buttons
+    if st.session_state.paper_vs:
+        st.markdown("**Loaded papers**")
+        for fname in list(st.session_state.paper_vs.keys()):
+            col1, col2 = st.columns([4, 1])
+            col1.markdown(f"📄 {fname}", help=fname)
+            if col2.button("✕", key=f"remove_{fname}", help=f"Remove {fname}"):
+                # Remove from session
+                fhash = st.session_state.paper_hashes.pop(fname, None)
+                st.session_state.paper_vs.pop(fname, None)
+                st.session_state.chat_history.pop(fname, None)
+
+                # Remove from disk and metadata
+                if fhash and fhash in disk_meta:
+                    delete_index(disk_meta.pop(fhash))
+                    save_metadata(disk_meta)
+
+                # Rebuild global store without the removed paper
+                st.session_state.global_vs = merge_vector_stores(
+                    list(st.session_state.paper_vs.values())
+                )
+                st.rerun()
+    else:
+        st.info("No papers loaded yet.")
+
+
+# ── Process uploaded files ─────────────────────────────────────────────────────
+if uploaded_files:
+    newly_indexed = False
+
+    for file in uploaded_files:
+        raw_bytes = file.read()
+        fhash = file_hash(raw_bytes)
+
+        if st.session_state.paper_hashes.get(file.name) == fhash:
+            continue  # Already loaded with same content
+
+        if fhash in disk_meta:
+            with st.spinner(f"Loading saved index for **{file.name}**…"):
+                vs = load_index(disk_meta[fhash], embedder)
+            if vs is not None:
+                st.session_state.paper_vs[file.name] = vs
+                st.session_state.paper_hashes[file.name] = fhash
+                st.toast(f"✅ Loaded {file.name} from disk")
+                newly_indexed = True
                 continue
-                
-            st.session_state.paper_vs[file.name] = vs
-            global_text += text + "\n"
-            
-    if global_text.strip() == "":
-        st.warning("No text found in any of the uploaded papers. Global vector store will not be created.")
-    else:
-        with st.spinner("updating global embeddings..."):
-            st.session_state.global_vs = build_vector_store(global_text)
 
-    st.success("All papers processed successfully! You can now ask questions about any paper.")
+        with st.spinner(f"Reading **{file.name}**…"):
+            raw_text = extract_text(file)
+            text = raw_text if isinstance(raw_text, str) else "\n".join(raw_text)
 
+        if not text.strip():
+            st.warning(f"No text found in **{file.name}**. Skipping.")
+            continue
+
+        with st.spinner(f"Building embeddings for **{file.name}**…"):
+            vs = build_vector_store(text, embedder, source_name=file.name)
+
+        if vs is None:
+            st.warning(f"Could not build index for **{file.name}**. Skipping.")
+            continue
+
+        iname = index_name_for_hash(fhash)
+        save_index(iname, vs)
+        disk_meta[fhash] = iname
+        save_metadata(disk_meta)
+
+        st.session_state.paper_vs[file.name] = vs
+        st.session_state.paper_hashes[file.name] = fhash
+        st.toast(f"✅ Indexed {file.name}")
+        newly_indexed = True
+
+    if newly_indexed and st.session_state.paper_vs:
+        with st.spinner("Rebuilding global index…"):
+            st.session_state.global_vs = merge_vector_stores(
+                list(st.session_state.paper_vs.values())
+            )
+
+
+# ── Main area ─────────────────────────────────────────────────────────────────
+st.title("Research Paper Reader")
+
+if not st.session_state.paper_vs:
+    st.info("👈 Upload PDFs from the sidebar to get started.")
+    st.stop()
+
+# Paper selector
 options = ["All papers"] + list(st.session_state.paper_vs.keys())
-selected_paper = st.selectbox("Select a paper", options)
+selected_paper = st.selectbox("Query scope", options)
 
+# Show a badge if the query looks like a comparison and "All papers" is selected
+query_hint = st.empty()
 
-for msg in st.session_state.messages:
-    st.chat_message(msg["role"]).write(msg["content"])
-    
-query = st.chat_input("Ask a question about the paper")
-if query is not None:
-    st.chat_message("user").write(query)
-    st.session_state.messages.append({"role": "user", "content": query})
-    
-    if selected_paper == "All papers":
-        vs = st.session_state.global_vs
-    else:
-        vs = st.session_state.paper_vs.get(selected_paper)
+# Ensure a history list exists for this scope
+if selected_paper not in st.session_state.chat_history:
+    st.session_state.chat_history[selected_paper] = []
+
+history = st.session_state.chat_history[selected_paper]
+
+# Clear chat button (inline with selector)
+col_sel, col_clr = st.columns([5, 1])
+with col_clr:
+    if st.button("Clear chat", use_container_width=True):
+        st.session_state.chat_history[selected_paper] = []
+        st.rerun()
+
+# Render conversation history
+for msg in history:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# ── Chat input ─────────────────────────────────────────────────────────────────
+query = st.chat_input("Ask a question about the paper(s)…")
+
+if query:
+    # Show comparison badge when applicable
+    if selected_paper == "All papers" and is_comparison_query(query):
+        query_hint.info(
+            "🔀 Comparison mode — answering paper-by-paper then summarising."
+        )
+
+    # Resolve which FAISS store to use
+    vs = (
+        st.session_state.global_vs
+        if selected_paper == "All papers"
+        else st.session_state.paper_vs.get(selected_paper)
+    )
+
+    with st.chat_message("user"):
+        st.markdown(query)
+    history.append({"role": "user", "content": query})
+
     with st.chat_message("assistant"):
-        with st.spinner("Finding the answer..."):
-            answer = rag_answer(query, vs)
-            st.write(answer)
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+        # Stream the response token-by-token
+        streamed = st.write_stream(
+            rag_stream(
+                query=query,
+                vs=vs,
+                history=history[:-1],           # exclude the query we just added
+                paper_stores=st.session_state.paper_vs if selected_paper == "All papers" else None,
+            )
+        )
+
+    # st.write_stream returns the full concatenated string
+    history.append({"role": "assistant", "content": streamed})

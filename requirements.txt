@@ -1,0 +1,36 @@
+# Python version: 3.11  (see notes below)
+#
+# INSTALLATION
+# ------------
+# GPU (NVIDIA CUDA 12.x):
+#   pip install -r requirements.txt
+#   pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+#   pip install faiss-gpu==1.9.0
+#
+# CPU only:
+#   pip install -r requirements.txt
+#   pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+#   pip install faiss-cpu==1.9.0
+#
+# NOTE: torch and faiss are intentionally excluded from this file because
+# they require different index URLs depending on GPU vs CPU.
+# Install them separately using the commands above.
+# =============================================================================
+
+# ── Streamlit UI ───────────────────────────────────────────────────────────────
+streamlit==1.45.1
+
+# ── LangChain stack ────────────────────────────────────────────────────────────
+langchain==1.2.16
+langchain-core==1.3.2
+langchain-community==0.3.31
+langchain-ollama==1.1.0
+
+# ── Embeddings ─────────────────────────────────────────────────────────────────
+sentence-transformers==5.4.1
+
+# ── PDF parsing (used by paper_handler.py) ─────────────────────────────────────
+pymupdf==1.27.2.3
+
+# ── Utilities (stdlib supplements) ────────────────────────────────────────────
+numpy>=1.26,<3.0          # required by faiss, sentence-transformers, torch
