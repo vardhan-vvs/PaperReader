@@ -2,3 +2,4 @@
 PaperReaderEnv/
 *.pyc
 */__pycache__/
+faiss_indexes/
